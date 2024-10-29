@@ -1,20 +1,27 @@
 
 import os
+import httpx
+import traceback
 from openai import OpenAI
-openai_client = OpenAI(
-    # defaults to os.environ.get("OPENAI_API_KEY")
-    api_key="enter_your_OpenAI_api_key"
-)
+# Fetch the OpenAI API key from the environment variable
+openai_api_key = os.getenv('OPENAI_API_KEY')
+if not openai_api_key:
+    raise ValueError("OpenAI API key not found. Please set the 'OPENAI_API_KEY' environment variable.")
+
+openai_client = OpenAI(api_key=openai_api_key)
 from datetime import datetime
 import spacy
+from fastapi import WebSocket
 import nltk
 from nltk.corpus import wordnet as wn
 from collections import defaultdict
 from dataclasses import dataclass
 from sklearn.metrics.pairwise import cosine_similarity
 import matplotlib.pyplot as plt
-from pymongo import MongoClient
+from motor.motor_asyncio import AsyncIOMotorClient
 import logging
+import sys
+import json
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
@@ -23,26 +30,27 @@ nlp = spacy.load('en_core_web_md')
 nlp_model = nlp
 
 # MongoDB connection to retrieve diary entries
-client = MongoClient("mongodb://localhost:27017")
+client = AsyncIOMotorClient("mongodb://localhost:27017")
 db = client['mydatabase']
 collection = db['entries']
 
 
 # Function to fetch diary entries from MongoDB
-def fetch_diary_entries(user_id: str):
-    """Fetch all diary entries for a user from MongoDB."""
-    entries = collection.find({"user_id": user_id})
+#async def fetch_diary_entries(user_id: str):
+ #   """Fetch all diary entries for a user from MongoDB asynchronously."""
+ #   entries_cursor = collection.find({"user_id": user_id})
+ #   diary_entries = {}
     
-    diary_entries = {}
-    for entry in entries:
-        # Convert the 'time' field from string to date object
-        entry_date = datetime.strptime(entry['time'], '%Y-%m-%d').date()
-        # Append the content to the respective date in diary_entries
-        if entry_date not in diary_entries:
-            diary_entries[entry_date] = []
-        diary_entries[entry_date].append(entry['content'])
+ #   async for entry in entries_cursor:
+ #       # Convert the 'time' field from string to date object
+ #       entry_date = datetime.strptime(entry['time'], '%Y-%m-%d').date()
+  #      # Append the content to the respective date in diary_entries
+ #       if entry_date not in diary_entries:
+ #           diary_entries[entry_date] = []
+  #      diary_entries[entry_date].append(entry['content'])
     
-    return diary_entries
+ #   return diary_entries
+
 
 # Define your Trait data structure and functions
 @dataclass
@@ -342,24 +350,36 @@ def calculate_daily_scores(diary_entries, nlp_model, expanded_dict):
         daily_scores[entry_date] = dict(cumulative_scores)  # Make a copy for each day's cumulative state
 
     return daily_scores
+# Function to prepare score_changes for MongoDB
+def prepare_score_changes_for_mongo(score_changes):
+    # Convert all datetime.date keys to strings for score changes
+    score_changes_str = {date.strftime("%Y-%m-%d"): changes for date, changes in score_changes.items()}
+    return score_changes_str
 
 
-# Function to track changes in emotional scores
+# Ensure that 'daily_scores' is consistent with datetime.date keys
 def track_score_changes(daily_scores):
-    sorted_dates = sorted(daily_scores.keys())
+    sorted_dates = sorted(daily_scores.keys())  # Ensure all keys are datetime.date
     previous_day_scores = None
     score_changes = {}
+    
     for date in sorted_dates:
+        if isinstance(date, str):
+            # If the date is a string, convert it to a datetime object
+            date = datetime.strptime(date, "%Y-%m-%d").date()
+        
         if previous_day_scores is None:
             score_changes[date] = {trait: 0 for trait in daily_scores[date]}
         else:
             day_changes = {}
             for trait, score in daily_scores[date].items():
                 previous_score = previous_day_scores.get(trait, 0)
-                day_changes[trait] = score - previous_score
+                day_changes[trait] = score - previous_score  # Calculation between numerical values
             score_changes[date] = day_changes
         previous_day_scores = daily_scores[date]
+
     return score_changes
+
 
 def accumulate_scores(daily_scores):
     accumulated_scores = defaultdict(float)
@@ -447,15 +467,19 @@ def prepare_context_for_agent_1(diary_entries, daily_scores, accumulated_scores,
         context_agent_1 += f"{trait}: {score}\n"
     
     context_agent_1 += "\nTop Traits:\n"
-    for trait, score in top_traits:
-        context_agent_1 += f"{trait}: {score}\n"
+    for trait_score in top_traits:
+        if isinstance(trait_score, tuple):
+            trait, score = trait_score
+            context_agent_1 += f"{trait}: {score}\n"
+        else:
+            context_agent_1 += f"{trait_score}: No score available\n"
     
     context_agent_1 += "\nAnalysis:\nPlease provide a psychological analysis of the diary writer based on the above information."
     return context_agent_1
 
 
 # Function to get ChatGPT's response
-def get_analysis_from_chatgpt(context_agent_1):
+async def get_analysis_from_chatgpt(context_agent_1):
     system_prompt = (
         "You are a psychologist analyzing diary entries using a framework that includes tracking emotional scores, "
         "cumulative trait scores, and identifying key psychological traits over time. The framework analyzes traits "
@@ -465,14 +489,37 @@ def get_analysis_from_chatgpt(context_agent_1):
         "Use the numerical scores provided to interpret the intensity of each trait, noting any significant increases or decreases. "
         "Finally, offer recommendations on managing stress, enhancing well-being, and nurturing positive traits, along with any resources or practices that could aid in personal development."
     )
-    response = openai_client.chat.completions.create(
-        model="gpt-4",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": context_agent_1}
-        ]
-    )
-    return response.choices[0].message.content
+    # Log context for debugging
+    logging.debug(f"Context for agent 1 being sent: {context_agent_1}")
+        
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+        response = await client.post(
+            "https://api.openai.com/v1/chat/completions", # Ensure the correct OpenAI endpoint "https://api.openai.com/v1/engines/gpt-4/completions"
+            headers={"Authorization": f"Bearer {openai_api_key}"},
+            json={
+                "model": "gpt-4",
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": context_agent_1}
+                ]
+            }
+        )
+        
+        # Check if the response is successful
+        if response.status_code != 200:
+            logging.error(f"OpenAI API error: {response.status_code} - {response.text}")
+            if response.status_code == 429:
+                logging.error("Rate limit exceeded. Try again later.")
+            raise ValueError(f"OpenAI API returned an error: {response.text}")
+
+    result = response.json()
+
+    # Ensure 'choices' exist in the result
+    if "choices" not in result or not result['choices']:
+        logging.error(f"Unexpected response format: {result}")
+        raise ValueError(f"Unexpected response format from OpenAI API: {result}")
+
+    return result['choices'][0]['message']['content']
 
 
 # Prepare context for ChatGPT
@@ -483,88 +530,194 @@ def prepare_context_for_agent_2(diary_entries, daily_scores, accumulated_scores,
     # Add tone to context
     context_agent_2 += f"\nTone for the analysis is '{tone}'. Please engage with the user based on this tone."  
 
-    context_agent_2 += "Day-to-Day Score Changes:\n"
-    context_agent_2 += "Diary Entries:\n"
+    # Add Diary Entries
+    context_agent_2 += "\nDiary Entries:\n"
+    for date, entries in diary_entries.items():
+        context_agent_2 += f"{date}:\n"
+        for entry in entries:
+            context_agent_2 += f"- {entry}\n"  # Display actual diary content
 
+    # Add Day-to-Day Score Changes
+    context_agent_2 += "\nDay-to-Day Score Changes:\n"
     for date, scores in daily_scores.items():
         context_agent_2 += f"{date}: {scores}\n"
-    
+
+    # Accumulated Trait Scores
     context_agent_2 += "\nAccumulated Trait Scores:\n"
     for trait, score in accumulated_scores.items():
         context_agent_2 += f"{trait}: {score}\n"
-    
-    # Adding top traits with resource suggestions
+
+# Adding top traits with resource suggestions
     top_traits_with_resources = get_top_traits_with_resources(accumulated_scores, self_actualization_words, num_traits=5)
     context_agent_2 += "\nTop Traits with Resource Suggestions:\n"
     for trait, score, suggestion in top_traits_with_resources:
         context_agent_2 += f"{trait} (Score: {score}): {suggestion}\n"
-
+        
     # Adding weekly summary
-    weekly_summary = calculate_weekly_summary(daily_scores)
-    context_agent_2 += "\nWeekly Summary:\n"
-    for trait, score in weekly_summary.items():
-        context_agent_2 += f"{trait}: {score}\n"
+    #weekly_summary = calculate_weekly_summary(daily_scores)
+    #context_agent_2 += "\nWeekly Summary:\n"
+    #for trait, score in weekly_summary.items():
+    #    context_agent_2 += f"{trait}: {score}\n"
     
     # Adding goal suggestions
-    goal_suggestions = provide_goal_suggestions(top_traits)
-    context_agent_2 += "\nGoals and Recommendations:\n"
-    for suggestion in goal_suggestions:
-        context_agent_2 += f"{suggestion}\n"          
+   #goal_suggestions = provide_goal_suggestions(top_traits)
+    #context_agent_2 += "\nGoals and Recommendations:\n"
+   # for suggestion in goal_suggestions:
+    #    context_agent_2 += f"{suggestion}\n"          
         
     context_agent_2 += "\nAnalysis:\nPlease provide a psychological analysis of the diary writer based on the above information."
+    
+    # Add the logging right after the context is fully prepared
+    logging.debug(f"Context being sent to agent 2: {context_agent_2}")
+    
     return context_agent_2
 
 # Function to get the latest diary entry and tone
-def get_latest_entry_and_tone(user_id: str, daily_scores: dict):
-    """Fetch the latest diary entry and determine the tone."""
-    # Fetch the diary entries for the user
-    diary_entries = fetch_diary_entries(user_id)
+async def get_latest_entry_and_tone(user_id: str, daily_scores: dict):
+    """Fetch the latest diary entry and determine the tone asynchronously."""
+    # Fetch the diary entries for the user asynchronously
+    diary_entries = await fetch_diary_entries(user_id)
+    
     if not diary_entries:
         raise ValueError("No diary entries found for the user.")
+    
     # Find the latest diary entry date
     latest_entry_date = max(diary_entries.keys())
+    
     # Check if daily_scores contains data for the latest entry
     if latest_entry_date not in daily_scores:
         raise ValueError(f"No scores found for the latest entry date: {latest_entry_date}")
+    
     # Determine the tone based on the latest entry's daily score
     tone = determine_tone(daily_scores[latest_entry_date])
+    
     return latest_entry_date, tone
 
-# Function for follow-up interactions
-def follow_up_questions(user_id, initial_analysis, diary_entries, daily_scores, score_changes, accumulated_scores, top_traits, tone):
-    diary_summary = "Here are the original diary entries for reference:\n"
-    for date, entries in diary_entries.items():
-        diary_summary += f"{date}:\n"
-        for entry in entries:
-            diary_summary += f"  - {entry}\n"
 
-    # Fetch the latest diary entry and tone
-    latest_entry_date, tone = get_latest_entry_and_tone(user_id, daily_scores)
-    
-    # Prepare a comprehensive summary of diary entries and analysis details for context
-    context_agent_2 = prepare_context_for_agent_2(diary_entries, daily_scores, accumulated_scores, top_traits,tone)
 
-    follow_up_prompt = generate_reflective_prompt(top_traits[0][0])  # Assume top_traits is a list of (trait, score)
-    print("\nYou can now ask follow-up questions based on this analysis. Type 'exit' to end the conversation.\n")
-    
-    # Start interactive loop
-    while True:
-        user_question = input("Your question: ")
-        if user_question.lower() == 'exit':
-            print("Ending follow-up session.")
-            break
-        
-        # Sending the follow-up question with full context to ChatGPT
-        follow_up_response = openai_client.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": "You are an assistant helping answer follow-up questions on a psychological analysis of diary entries."},
-                {"role": "assistant", "content": initial_analysis},
-                {"role": "assistant", "content": diary_summary},
-                {"role": "assistant", "content": context_agent_2},
-                {"role": "user", "content": user_question}
-            ]
+
+
+async def handle_follow_up_question(websocket: WebSocket, user_id: str, user_question: str):
+    logging.debug(f"Received follow-up question for user {user_id}: {user_question}")
+
+    try:
+        # Retrieve stored context data from MongoDB asynchronously
+        context_data = await db['context_agent_data'].find_one({"user_id": user_id})
+        if not context_data:
+            logging.debug(f"No prior context data found for user {user_id}")
+            await websocket.send_text("No prior analysis found. Please submit a diary entry first.")
+            return
+        logging.debug(f"Retrieved context data for user {user_id}: {context_data}")
+
+        # Extract context data for context agent 2
+        analysis = context_data.get('analysis')
+        diary_entries = context_data.get('diary_entries')
+        daily_scores = context_data.get('daily_scores')
+        accumulated_scores = context_data.get('accumulated_scores')
+        top_traits = context_data.get('top_traits')
+
+        # Fetch the latest diary entry and tone asynchronously
+        latest_entry_date, tone = await get_latest_entry_and_tone(user_id, daily_scores)
+
+        # Prepare context agent 2 with updated context (including tone)
+        logging.debug("Preparing context for context agent 2")
+        context_agent_2 = prepare_context_for_agent_2(diary_entries, daily_scores, accumulated_scores, top_traits, tone)
+        logging.debug(f"Context agent 2 content: {context_agent_2}")
+
+        # Prepare system prompt for context agent 2
+        system_prompt_2 = (
+            "You are an assistant helping answer follow-up questions on a psychological analysis of diary entries. "
+            "You are a psychologist analyzing diary entries using a framework that includes tracking emotional scores, "
+            "cumulative trait scores, and identifying key psychological traits over time. The framework analyzes traits "
+            "such as cautiousness, happiness, sadness, resilience, social connection, and self-esteem, and calculates changes over time. "
+            "Please analyze trends in emotional states, identify recurring themes, and provide insights on the writer’s psychological traits and overall mental well-being. "
+            "Focus on how the individual’s emotional state fluctuates, suggesting areas for personal growth based on the most prominent traits. "
+            "Use the numerical scores provided to interpret the intensity of each trait, noting any significant increases or decreases."
         )
+
+        # Build messages for ChatGPT with context agent 2 and follow-up question
+        messages = [
+            {"role": "system", "content": system_prompt_2},
+            {"role": "assistant", "content": analysis},  # Include the prior analysis
+            {"role": "assistant", "content": context_agent_2},  # Include the context with daily_scores
+            {"role": "user", "content": user_question}  # The current follow-up question
+        ]
+        # Log the messages for debugging purposes
+        logging.debug(f"Messages payload: {json.dumps(messages, indent=2)}")
+        # Retrieve previous follow-up answer from MongoDB asynchronously
+        previous_follow_up = await db['context_agent_follow_ups'].find_one({"user_id": user_id})
+        if previous_follow_up:
+            messages.append({"role": "assistant", "content": previous_follow_up.get('previous_follow_up_answer')})
+
+        # Increase the timeout for the request and handle timeouts gracefully
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+                response = await client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {openai_api_key}"},
+                    json={
+                        "model": "gpt-4",
+                        "messages": messages
+                    }
+                )
+        except httpx.ReadTimeout:
+            logging.error("OpenAI API request timed out.")
+            await websocket.send_text("Sorry, the server took too long to respond. Please try again later.")
+            return
+
+        # Check if the response is successful
+        if response.status_code != 200:
+            error_message = f"OpenAI API Error: {response.status_code} - {response.text}"
+            logging.error(error_message)
+            await websocket.send_text(f"Error: Unable to retrieve follow-up response. {response.text}")
+            return
         
-        # Print the response to the follow-up question
-        print("ChatGPT Follow-Up Response:\n", follow_up_response.choices[0].message.content)
+        # Log the full API response for debugging
+        logging.debug(f"OpenAI API response: {response.text}")
+        # Parse the response JSON
+        # After receiving the response
+        try:
+            result = response.json()
+            logging.debug(f"Parsed API response: {result}")
+        except json.JSONDecodeError as json_error:
+            logging.error(f"Failed to decode JSON from OpenAI API response: {json_error}")
+            logging.error(f"Raw response text: {response.text}")
+            await websocket.send_text("Error: Failed to parse response from the server. Please try again later.")
+            return
+
+
+        # Ensure that 'choices' is in the response
+        if "choices" not in result or not result['choices']:
+            logging.error(f"Unexpected response format: {result}")
+            await websocket.send_text("Error: Unexpected response format from ChatGPT.")
+            return
+        # Extract the response from ChatGPT
+        follow_up_answer = result['choices'][0]['message']['content']
+
+        # Log the follow-up answer for debugging
+        logging.debug(f"Follow-up answer received from ChatGPT: {follow_up_answer}")
+
+        # Send the follow-up answer or handle if missing
+        if follow_up_answer:
+            await websocket.send_text(f"ChatGPT Response: {follow_up_answer}")
+        else:
+            logging.error("No response from ChatGPT.")
+            await websocket.send_text("ChatGPT was unable to provide a response.")
+
+
+        # Store the follow-up answer in MongoDB asynchronously for future follow-up references
+        await db['context_agent_follow_ups'].update_one(
+            {"user_id": user_id},
+            {"$set": {"previous_follow_up_answer": follow_up_answer}},
+            upsert=True
+        )
+
+        # Return the follow-up response to the WebSocket
+        await websocket.send_text(follow_up_answer)
+
+    except Exception as e:
+        logging.error(f"Error occurred in handle_follow_up_question: {str(e)}")
+        logging.error(traceback.format_exc())  # Log full traceback for better diagnostics
+        await websocket.send_text(f"Error occurred: {str(e)}")
+
+
