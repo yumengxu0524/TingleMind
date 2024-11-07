@@ -1,0 +1,8 @@
+# backend debug cheatsheet
+
+# ssh -i C:/Users/ymx19/Tingle/TingleMind.pem ubuntu@ec2-18-217-234-232.us-east-2.compute.amazonaws.com
+
+# sudo systemctl restart tingle_app.service
+# sudo journalctl -u tingle_app.service -f    (check log for bug fix)
+
+#access to MongoDB user database: https://www.tinglemind.com/context_agent_data/user_name
